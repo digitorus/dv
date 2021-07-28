@@ -1,5 +1,5 @@
-// Package simply implements a DNS provider for solving the DNS-01 challenge using Simply.com.
-package simply
+// Package allinkl implements a DNS provider for solving the DNS-01 challenge using all-inkl.
+package allinkl
 
 import (
 	"errors"
@@ -11,17 +11,16 @@ import (
 
 	"github.com/entrustcorporation/dv/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/entrustcorporation/dv/providers/simply/internal"
+	"github.com/entrustcorporation/dv/providers/allinkl/internal"
 )
 
 // Environment variables names.
 const (
-	envNamespace = "SIMPLY_"
+	envNamespace = "ALL_INKL_"
 
-	EnvAccountName = envNamespace + "ACCOUNT_NAME"
-	EnvAPIKey      = envNamespace + "API_KEY"
+	EnvLogin    = envNamespace + "LOGIN"
+	EnvPassword = envNamespace + "PASSWORD"
 
-	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 	EnvHTTPTimeout        = envNamespace + "HTTP_TIMEOUT"
@@ -29,8 +28,8 @@ const (
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	AccountName        string
-	APIKey             string
+	Login              string
+	Password           string
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
 	TTL                int
@@ -40,9 +39,8 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                env.GetOrDefaultInt(EnvTTL, dns01.DefaultTTL),
-		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 5*time.Minute),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 10*time.Second),
+		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -54,43 +52,36 @@ type DNSProvider struct {
 	config *Config
 	client *internal.Client
 
-	recordIDs   map[string]int64
+	recordIDs   map[string]string
 	recordIDsMu sync.Mutex
 }
 
-// NewDNSProvider returns a DNSProvider instance configured for Simply.com.
-// Credentials must be passed in the environment variable: SIMPLY_ACCOUNT_NAME, SIMPLY_API_KEY.
+// NewDNSProvider returns a DNSProvider instance configured for all-inkl.
+// Credentials must be passed in the environment variable: ALL_INKL_API_KEY, ALL_INKL_PASSWORD.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(EnvAccountName, EnvAPIKey)
+	values, err := env.Get(EnvLogin, EnvPassword)
 	if err != nil {
-		return nil, fmt.Errorf("simply: %w", err)
+		return nil, fmt.Errorf("allinkl: %w", err)
 	}
 
 	config := NewDefaultConfig()
-	config.AccountName = values[EnvAccountName]
-	config.APIKey = values[EnvAPIKey]
+	config.Login = values[EnvLogin]
+	config.Password = values[EnvPassword]
 
 	return NewDNSProviderConfig(config)
 }
 
-// NewDNSProviderConfig return a DNSProvider instance configured for Simply.com.
+// NewDNSProviderConfig return a DNSProvider instance configured for all-inkl.
 func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	if config == nil {
-		return nil, errors.New("simply: the configuration of the DNS provider is nil")
+		return nil, errors.New("allinkl: the configuration of the DNS provider is nil")
 	}
 
-	if config.AccountName == "" {
-		return nil, errors.New("simply: missing credentials: account name")
+	if config.Login == "" || config.Password == "" {
+		return nil, errors.New("allinkl: missing credentials")
 	}
 
-	if config.APIKey == "" {
-		return nil, errors.New("simply: missing credentials: api key")
-	}
-
-	client, err := internal.NewClient(config.AccountName, config.APIKey)
-	if err != nil {
-		return nil, fmt.Errorf("simply: failed to create client: %w", err)
-	}
+	client := internal.NewClient(config.Login, config.Password)
 
 	if config.HTTPClient != nil {
 		client.HTTPClient = config.HTTPClient
@@ -99,7 +90,7 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	return &DNSProvider{
 		config:    config,
 		client:    client,
-		recordIDs: make(map[string]int64),
+		recordIDs: make(map[string]string),
 	}, nil
 }
 
@@ -115,22 +106,26 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 	authZone, err := dns01.FindZoneByFqdn(fqdn)
 	if err != nil {
-		return fmt.Errorf("simply: could not determine zone for domain %q: %w", domain, err)
+		return fmt.Errorf("allinkl: could not determine zone for domain %q: %w", domain, err)
 	}
-	authZone = dns01.UnFqdn(authZone)
+
+	credential, err := d.client.Authentication(60, true)
+	if err != nil {
+		return fmt.Errorf("allinkl: %w", err)
+	}
 
 	subDomain := dns01.UnFqdn(strings.TrimSuffix(fqdn, authZone))
 
-	recordBody := internal.Record{
-		Name: subDomain,
-		Data: value,
-		Type: "TXT",
-		TTL:  d.config.TTL,
+	record := internal.DNSRequest{
+		ZoneHost:   authZone,
+		RecordType: "TXT",
+		RecordName: subDomain,
+		RecordData: value,
 	}
 
-	recordID, err := d.client.AddRecord(authZone, recordBody)
+	recordID, err := d.client.AddDNSSettings(credential, record)
 	if err != nil {
-		return fmt.Errorf("simply: failed to add record: %w", err)
+		return fmt.Errorf("allinkl: %w", err)
 	}
 
 	d.recordIDsMu.Lock()
@@ -144,29 +139,23 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 	fqdn, _ := dns01.GetRecord(domain, keyAuth)
 
-	authZone, err := dns01.FindZoneByFqdn(fqdn)
+	credential, err := d.client.Authentication(60, true)
 	if err != nil {
-		return fmt.Errorf("simply: could not determine zone for domain %q: %w", domain, err)
+		return fmt.Errorf("allinkl: %w", err)
 	}
-	authZone = dns01.UnFqdn(authZone)
 
 	// gets the record's unique ID from when we created it
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
 	if !ok {
-		return fmt.Errorf("simply: unknown record ID for '%s' '%s'", fqdn, token)
+		return fmt.Errorf("allinkl: unknown record ID for '%s' '%s'", fqdn, token)
 	}
 
-	err = d.client.DeleteRecord(authZone, recordID)
+	_, err = d.client.DeleteDNSSettings(credential, recordID)
 	if err != nil {
-		return fmt.Errorf("simply: failed to delete TXT records: fqdn=%s, recordID=%d: %w", fqdn, recordID, err)
+		return fmt.Errorf("allinkl: %w", err)
 	}
-
-	// deletes record ID from map
-	d.recordIDsMu.Lock()
-	delete(d.recordIDs, token)
-	d.recordIDsMu.Unlock()
 
 	return nil
 }

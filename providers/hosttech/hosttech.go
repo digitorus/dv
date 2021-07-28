@@ -1,25 +1,25 @@
-// Package simply implements a DNS provider for solving the DNS-01 challenge using Simply.com.
-package simply
+// Package hosttech implements a DNS provider for solving the DNS-01 challenge using hosttech.
+package hosttech
 
 import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/entrustcorporation/dv/dns01"
 	"github.com/go-acme/lego/v4/platform/config/env"
-	"github.com/entrustcorporation/dv/providers/simply/internal"
+	"github.com/entrustcorporation/dv/providers/hosttech/internal"
 )
 
 // Environment variables names.
 const (
-	envNamespace = "SIMPLY_"
+	envNamespace = "HOSTTECH_"
 
-	EnvAccountName = envNamespace + "ACCOUNT_NAME"
-	EnvAPIKey      = envNamespace + "API_KEY"
+	EnvAPIKey = envNamespace + "API_KEY"
 
 	EnvTTL                = envNamespace + "TTL"
 	EnvPropagationTimeout = envNamespace + "PROPAGATION_TIMEOUT"
@@ -29,7 +29,6 @@ const (
 
 // Config is used to configure the creation of the DNSProvider.
 type Config struct {
-	AccountName        string
 	APIKey             string
 	PropagationTimeout time.Duration
 	PollingInterval    time.Duration
@@ -40,9 +39,9 @@ type Config struct {
 // NewDefaultConfig returns a default configuration for the DNSProvider.
 func NewDefaultConfig() *Config {
 	return &Config{
-		TTL:                env.GetOrDefaultInt(EnvTTL, dns01.DefaultTTL),
-		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, 5*time.Minute),
-		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, 10*time.Second),
+		TTL:                env.GetOrDefaultInt(EnvTTL, 3600),
+		PropagationTimeout: env.GetOrDefaultSecond(EnvPropagationTimeout, dns01.DefaultPropagationTimeout),
+		PollingInterval:    env.GetOrDefaultSecond(EnvPollingInterval, dns01.DefaultPollingInterval),
 		HTTPClient: &http.Client{
 			Timeout: env.GetOrDefaultSecond(EnvHTTPTimeout, 30*time.Second),
 		},
@@ -54,43 +53,35 @@ type DNSProvider struct {
 	config *Config
 	client *internal.Client
 
-	recordIDs   map[string]int64
+	recordIDs   map[string]int
 	recordIDsMu sync.Mutex
 }
 
-// NewDNSProvider returns a DNSProvider instance configured for Simply.com.
-// Credentials must be passed in the environment variable: SIMPLY_ACCOUNT_NAME, SIMPLY_API_KEY.
+// NewDNSProvider returns a DNSProvider instance configured for hosttech.
+// Credentials must be passed in the environment variable: HOSTTECH_API_KEY.
 func NewDNSProvider() (*DNSProvider, error) {
-	values, err := env.Get(EnvAccountName, EnvAPIKey)
+	values, err := env.Get(EnvAPIKey)
 	if err != nil {
-		return nil, fmt.Errorf("simply: %w", err)
+		return nil, fmt.Errorf("hosttech: %w", err)
 	}
 
 	config := NewDefaultConfig()
-	config.AccountName = values[EnvAccountName]
 	config.APIKey = values[EnvAPIKey]
 
 	return NewDNSProviderConfig(config)
 }
 
-// NewDNSProviderConfig return a DNSProvider instance configured for Simply.com.
+// NewDNSProviderConfig return a DNSProvider instance configured for hosttech.
 func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	if config == nil {
-		return nil, errors.New("simply: the configuration of the DNS provider is nil")
-	}
-
-	if config.AccountName == "" {
-		return nil, errors.New("simply: missing credentials: account name")
+		return nil, errors.New("hosttech: the configuration of the DNS provider is nil")
 	}
 
 	if config.APIKey == "" {
-		return nil, errors.New("simply: missing credentials: api key")
+		return nil, errors.New("hosttech: missing credentials")
 	}
 
-	client, err := internal.NewClient(config.AccountName, config.APIKey)
-	if err != nil {
-		return nil, fmt.Errorf("simply: failed to create client: %w", err)
-	}
+	client := internal.NewClient(config.APIKey)
 
 	if config.HTTPClient != nil {
 		client.HTTPClient = config.HTTPClient
@@ -99,7 +90,7 @@ func NewDNSProviderConfig(config *Config) (*DNSProvider, error) {
 	return &DNSProvider{
 		config:    config,
 		client:    client,
-		recordIDs: make(map[string]int64),
+		recordIDs: map[string]int{},
 	}, nil
 }
 
@@ -115,26 +106,28 @@ func (d *DNSProvider) Present(domain, token, keyAuth string) error {
 
 	authZone, err := dns01.FindZoneByFqdn(fqdn)
 	if err != nil {
-		return fmt.Errorf("simply: could not determine zone for domain %q: %w", domain, err)
+		return fmt.Errorf("hosttech: could not determine zone for domain %q: %w", domain, err)
 	}
-	authZone = dns01.UnFqdn(authZone)
 
-	subDomain := dns01.UnFqdn(strings.TrimSuffix(fqdn, authZone))
+	zone, err := d.client.GetZone(dns01.UnFqdn(authZone))
+	if err != nil {
+		return fmt.Errorf("hosttech: could not find zone for domain %q (%s): %w", domain, authZone, err)
+	}
 
-	recordBody := internal.Record{
-		Name: subDomain,
-		Data: value,
+	record := internal.Record{
 		Type: "TXT",
+		Name: dns01.UnFqdn(strings.TrimSuffix(fqdn, authZone)),
+		Text: value,
 		TTL:  d.config.TTL,
 	}
 
-	recordID, err := d.client.AddRecord(authZone, recordBody)
+	newRecord, err := d.client.AddRecord(strconv.Itoa(zone.ID), record)
 	if err != nil {
-		return fmt.Errorf("simply: failed to add record: %w", err)
+		return fmt.Errorf("hosttech: %w", err)
 	}
 
 	d.recordIDsMu.Lock()
-	d.recordIDs[token] = recordID
+	d.recordIDs[token] = newRecord.ID
 	d.recordIDsMu.Unlock()
 
 	return nil
@@ -146,27 +139,26 @@ func (d *DNSProvider) CleanUp(domain, token, keyAuth string) error {
 
 	authZone, err := dns01.FindZoneByFqdn(fqdn)
 	if err != nil {
-		return fmt.Errorf("simply: could not determine zone for domain %q: %w", domain, err)
+		return fmt.Errorf("hosttech: could not determine zone for domain %q: %w", domain, err)
 	}
-	authZone = dns01.UnFqdn(authZone)
+
+	zone, err := d.client.GetZone(dns01.UnFqdn(authZone))
+	if err != nil {
+		return fmt.Errorf("hosttech: could not find zone for domain %q (%s): %w", domain, authZone, err)
+	}
 
 	// gets the record's unique ID from when we created it
 	d.recordIDsMu.Lock()
 	recordID, ok := d.recordIDs[token]
 	d.recordIDsMu.Unlock()
 	if !ok {
-		return fmt.Errorf("simply: unknown record ID for '%s' '%s'", fqdn, token)
+		return fmt.Errorf("hosttech: unknown record ID for '%s' '%s'", fqdn, token)
 	}
 
-	err = d.client.DeleteRecord(authZone, recordID)
+	err = d.client.DeleteRecord(strconv.Itoa(zone.ID), strconv.Itoa(recordID))
 	if err != nil {
-		return fmt.Errorf("simply: failed to delete TXT records: fqdn=%s, recordID=%d: %w", fqdn, recordID, err)
+		return fmt.Errorf("hosttech: %w", err)
 	}
-
-	// deletes record ID from map
-	d.recordIDsMu.Lock()
-	delete(d.recordIDs, token)
-	d.recordIDsMu.Unlock()
 
 	return nil
 }
